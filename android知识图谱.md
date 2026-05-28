@@ -144,9 +144,14 @@ val handler = CoroutineExceptionHandler { _, exception ->
     Log.e("TAG", "Caught $exception")
 }
 
-// 方式三：SupervisorJob 防止异常传播
-viewModelScope.launch(SupervisorJob() + handler) {
-    // 子协程异常不会取消父协程
+// 方式三：SupervisorScope 防止异常传播
+// viewModelScope 内部已经是 SupervisorJob，无需额外创建
+viewModelScope.launch(handler) {
+    // 如果需要隔离多个子协程：
+    supervisorScope {
+        launch { /* 子协程1 */ }
+        launch { /* 子协程2，失败不影响1 */ }
+    }
 }
 ```
 
@@ -245,6 +250,193 @@ onPause → onStop → onSaveInstanceState → onDestroy
 - 客户端通过 Binder 驱动调用服务端方法
 - 数据通过 Parcel 序列化
 - 一次拷贝（mmap 共享内存）提高性能
+
+---
+
+#### 1.3.3 Notification 通知系统
+
+Android 8.0+ 引入了通知渠道（Notification Channel），所有通知必须归属到某个渠道，用户可按渠道精细控制通知行为。
+
+**创建通知渠道**
+
+```kotlin
+class MyApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannels()
+    }
+
+    private fun createNotificationChannels() {
+        val channel = NotificationChannel(
+            CHANNEL_ID_MESSAGES,
+            "消息通知",
+            NotificationManager.IMPORTANCE_HIGH  // 重要性决定展示方式
+        ).apply {
+            description = "用于显示聊天消息通知"
+            vibrationPattern = longArrayOf(0, 200, 100, 300)  // 震动模式：等待/震动/等待/震动
+            lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+        }
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
+    }
+}
+```
+
+**重要性等级与行为**
+
+| 级别 | 常量 | 行为 |
+|------|------|------|
+| 紧急 | `IMPORTANCE_HIGH` | 弹出横幅 + 声音 + 震动 |
+| 高 | `IMPORTANCE_DEFAULT` | 声音 |
+| 低 | `IMPORTANCE_LOW` | 无声音，状态栏显示 |
+| 最低 | `IMPORTANCE_MIN` | 静默，不显示图标 |
+| 无 | `IMPORTANCE_NONE` | 完全屏蔽 |
+
+用户可在系统设置中修改每个渠道的重要性，应用读取到的 `channel.importance` 为实际生效值。
+
+**发送通知**
+
+```kotlin
+val notification = NotificationCompat.Builder(this, CHANNEL_ID_MESSAGES)
+    .setSmallIcon(R.drawable.ic_notification)
+    .setContentTitle("新消息")
+    .setContentText("张三：你好")
+    .setPriority(NotificationCompat.PRIORITY_HIGH)
+    .setAutoCancel(true)           // 点击后自动消失
+    .setContentIntent(pendingIntent)  // 点击跳转
+    .addAction(R.drawable.ic_reply, "回复", replyPendingIntent)
+    .build()
+
+NotificationManagerCompat.from(this).notify(notificationId, notification)
+```
+
+**Android 13+ 运行时权限**
+
+```kotlin
+// Android 13+ 发送通知前需请求权限
+if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+    requestPermissions.launch(Manifest.permission.POST_NOTIFICATIONS)
+}
+```
+
+**FCM 推送基础**
+
+```
+App Server → FCM Server → Android Device
+                    ↓
+            系统级长连接（无需应用保活）
+                    ↓
+         BroadcastReceiver/FirebaseMessagingService
+                    ↓
+              显示通知/处理数据
+```
+
+```kotlin
+class MyFirebaseMessagingService : FirebaseMessagingService() {
+    override fun onMessageReceived(message: RemoteMessage) {
+        // 前台时自定义处理，后台时系统自动显示通知
+        if (isAppInForeground()) {
+            showCustomNotification(message)
+        }
+    }
+
+    override fun onNewToken(token: String) {
+        // 令牌刷新，上报到服务器
+        sendTokenToServer(token)
+    }
+}
+```
+
+**通知分组（Android 7+）**
+
+```kotlin
+// 同组通知折叠显示
+NotificationCompat.Builder(this, channelId)
+    .setGroup("chat_group")
+    .setGroupSummary(true)  // 分组摘要
+    .build()
+```
+
+**Bubble 气泡通知（Android 11+）**
+
+```kotlin
+// 类似 Facebook Messenger 的浮动气泡
+val bubbleIntent = NotificationCompat.BubbleMetadata.Builder(
+    bubblePendingIntent, Icon.createWithResource(this, R.drawable.ic_chat)
+).build()
+NotificationCompat.Builder(this, channelId)
+    .setBubbleMetadata(bubbleIntent)
+    .build()
+```
+
+---
+
+#### 1.3.4 SplashScreen API 与预测性返回手势
+
+**SplashScreen API（Android 12+ 强制）**
+
+Android 12 起，系统为所有 Activity 自动注入启动画面。自定义仅需控制主题和退出动画：
+
+```xml
+<!-- themes.xml -->
+<style name="Theme.MyApp.Splash" parent="Theme.SplashScreen">
+    <item name="windowSplashScreenBackground">@color/white</item>
+    <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+    <item name="postSplashScreenTheme">@style/Theme.MyApp</item>
+</style>
+
+// Activity 中控制退出时机
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen().apply {
+            setKeepOnScreenCondition { viewModel.isLoading }  // 加载完成前保持 Splash
+        }
+        super.onCreate(savedInstanceState)
+        setContent { ... }
+    }
+}
+```
+
+- 不再需要自定义 Splash Activity
+- `setKeepOnScreenCondition` 控制 Splash 显示时长，适合等数据加载
+
+**预测性返回手势（Android 14+）**
+
+Android 14 引入预测性返回（Predictive Back Gesture），用户侧滑返回时展示透明预览，让用户知道即将返回到哪个页面。
+
+```kotlin
+// 在 AndroidManifest.xml 中启用（Android 15 起默认启用）
+<application android:enableOnBackInvokedCallback="true">
+
+// Activity 中处理
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Android 14+ 使用 OnBackInvokedCallback 替代 onBackPressed
+        onBackInvokedDispatcher.registerOnBackInvokedCallback(
+            OnBackInvokedDispatcher.PRIORITY_DEFAULT
+        ) {
+            // 自定义返回逻辑
+            if (hasUnsavedChanges()) {
+                showDiscardDialog()
+            } else {
+                finish()
+            }
+        }
+    }
+}
+```
+
+**Compose 中适配预测性返回**
+
+```kotlin
+@Composable
+fun PredictiveBackScreen() {
+    BackHandler(enabled = hasUnsavedChanges) {
+        showDiscardDialog = true
+    }
+}
+```
 
 ---
 
@@ -507,7 +699,114 @@ val Context.userSettingsStore by protoDataStore<UserSettings>(
 )
 ```
 
-#### 2.3.4 WorkManager 后台任务
+#### 2.3.4 Room 数据库
+
+> Room 是 Android 官方 ORM，构建在 SQLite 之上，提供编译时 SQL 校验、Flow 集成和自动迁移支持。
+
+**核心注解**
+
+```kotlin
+@Entity(tableName = "users")
+data class User(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    @ColumnInfo(name = "user_name") val name: String,
+    val age: Int,
+    @Embedded val address: Address  // 嵌入对象，字段平铺在同一张表
+)
+
+data class Address(val city: String, val street: String)
+
+@Dao
+interface UserDao {
+    @Query("SELECT * FROM users WHERE age > :minAge")
+    fun getUsersOlderThan(minAge: Int): Flow<List<User>>  // Flow 自动观察变化
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertUser(user: User): Long
+
+    @Update
+    suspend fun updateUser(user: User)
+
+    @Delete
+    suspend fun deleteUser(user: User)
+
+    @Transaction
+    @Query("SELECT * FROM users")
+    fun getUsersWithOrders(): Flow<List<UserWithOrders>>  // 一对多关系
+}
+
+// 一对多关系
+data class UserWithOrders(
+    @Embedded val user: User,
+    @Relation(parentColumn = "id", entityColumn = "user_id")
+    val orders: List<Order>
+)
+
+@Database(entities = [User::class, Order::class], version = 1)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun userDao(): UserDao
+}
+```
+
+**为什么 Room 比原生 SQLite 好？**
+- 编译时校验 SQL：写错字段名编译不过，不会运行时崩溃
+- Flow 集成：`@Query` 返回 `Flow<List<T>>`，数据变化时自动发射新数据（通过 InvalidationTracker 监听表变更）
+- 协程原生支持：`suspend` 函数自动在 `TransactionExecutor`（后台线程池）执行
+- 无需手动游标管理、ContentValues、Cursor 转换
+
+**数据库版本迁移**
+
+```kotlin
+// 方式一：自动迁移（Room 2.4+，推荐简单变更用）
+@Database(
+    entities = [User::class],
+    version = 2,
+    autoMigrations = [
+        AutoMigration(from = 1, to = 2)
+    ]
+)
+
+// 方式二：手动 Migration（复杂变更，如数据迁移改造）
+val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+    }
+}
+
+// 方式三：破坏性迁移（开发阶段，数据不重要时）
+.fallbackToDestructiveMigration()
+```
+
+**常见问题**
+- **主线程访问**：Room 默认不允许主线程查询，需显式调用 `.allowMainThreadQueries()`（不推荐）
+- **@Relation 懒加载陷阱**：`@Relation` 注解的字段只在查询时填充，不自动更新；KMP 中不支持 `@Relation`，需用 `@Query` + 多表 JOIN
+- **Flow 触发频率**：InvalidationTracker 是表级监听，任意表变更都会触发表中所有 Flow 查询重新计算；高频写入需用 `distinctUntilChanged` 过滤
+- **Schema 导出**：发布版必须导出 schema JSON 用于测试自动迁移，配置 `room.schemaLocation` 并纳入版本控制
+
+**Room KMP（Kotlin 2.0+ / Room 2.7+）**
+
+Room 已支持 Kotlin Multiplatform，可在 commonMain 中定义 Entity 和 DAO：
+
+```kotlin
+// commonMain
+@Database(entities = [User::class], version = 1)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun userDao(): UserDao
+}
+
+fun getRoomDatabase(builder: RoomDatabase.Builder<AppDatabase>): AppDatabase {
+    return builder
+        .setDriver(BundledSQLiteDriver())  // 跨平台 SQLite 驱动
+        .build()
+}
+```
+- Android 端用 `Room.databaseBuilder(context, AppDatabase::class.java, "app.db")`
+- iOS 端用 `RoomDatabase.Builder` + `BundledSQLiteDriver`
+- 限制：不支持 `@Relation`、`@DatabaseView` 等仅 Android 功能
+
+---
+
+#### 2.3.5 WorkManager 后台任务
 
 **适用场景**
 - 延迟执行的后台任务（上传日志、同步数据）
@@ -540,6 +839,76 @@ val request = OneTimeWorkRequestBuilder<SyncWorker>()
     .build()
 WorkManager.getInstance(context).enqueue(request)
 ```
+
+---
+
+#### 2.3.6 Jetpack Navigation
+
+Compose Navigation 已在 [7.1.4 Compose Navigation](#714-compose-navigation) 详述，这里聚焦 View 体系下的 Navigation。
+
+**导航图定义（res/navigation/nav_graph.xml）**
+
+```xml
+<navigation xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    app:startDestination="@id/homeFragment">
+
+    <fragment
+        android:id="@+id/homeFragment"
+        android:name="com.example.HomeFragment">
+        <argument
+            android:name="userId"
+            app:argType="string" />
+        <action
+            android:id="@+id/action_to_detail"
+            app:destination="@id/detailFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/detailFragment"
+        android:name="com.example.DetailFragment">
+        <argument
+            android:name="itemId"
+            app:argType="integer" />
+        <deepLink app:uri="myapp://detail/{itemId}" />
+    </fragment>
+</navigation>
+```
+
+**Safe Args（类型安全传参）**
+
+```kotlin
+// 生成 HomeFragmentDirections 类，编译时校验参数类型
+val action = HomeFragmentDirections.actionToDetail(itemId = 42)
+findNavController().navigate(action)
+
+// 目标 Fragment 接收参数
+val args: DetailFragmentArgs by navArgs()
+val itemId = args.itemId
+```
+
+**Deep Link 处理**
+
+```kotlin
+// 方式一：在导航图中声明（见上方 XML deepLink）
+// 方式二：代码注册
+// AndroidManifest.xml 中通过 <nav-graph> 引用，自动处理
+```
+
+**Navigation 作用域 ViewModel**
+
+```kotlin
+// ViewModel 与导航图节点绑定，返回时自动清除
+class DetailFragment : Fragment() {
+    private val viewModel: DetailViewModel by navGraphViewModels(R.id.detailFragment)
+}
+```
+
+**常见问题**
+
+- **返回栈管理**：`NavigationUI.setupActionBarWithNavController()` 自动处理返回按钮
+- **跨导航图导航**：使用全局 action 或 `findNavController().navigate(R.id.otherGraph)`
+- **Activity 结果回传**：使用 `savedStateHandle` 而非 `onActivityResult`
 
 ---
 
@@ -580,6 +949,106 @@ class MainViewModel @Inject constructor(
     val uiState: StateFlow<UiState> = ...
 }
 ```
+
+**Hilt 作用域与生命周期**
+
+| 作用域 | 注解 | 生命周期 | 适用场景 |
+|--------|------|---------|---------|
+| Singleton | `@Singleton` | Application 生命周期 | 全局单例（API 客户端、数据库） |
+| ViewModelScoped | `@ViewModelScoped` | ViewModel 存活期间 | ViewModel 及其依赖 |
+| ActivityScoped | `@ActivityScoped` | Activity 存活期间 | Activity 级别的临时数据 |
+| FragmentScoped | `@FragmentScoped` | Fragment 存活期间 | Fragment 级别的 UI 状态 |
+| ServiceScoped | `@ServiceScoped` | Service 存活期间 | 前台/后台 Service 的依赖 |
+| Unscoped | 无注解（默认） | 每次注入创建新实例 | 无状态工具类 |
+
+```kotlin
+@Module
+@InstallIn(SingletonComponent::class)  // 安装到 Application 容器
+object NetworkModule {
+    @Singleton
+    @Provides
+    fun provideOkHttpClient(): OkHttpClient = OkHttpClient.Builder().build()
+
+    @Singleton
+    @Provides
+    fun provideRetrofit(client: OkHttpClient): Retrofit = Retrofit.Builder()
+        .client(client)
+        .baseUrl("https://api.example.com/")
+        .build()
+}
+
+@Module
+@InstallIn(ViewModelComponent::class)  // 安装到 ViewModel 容器
+object RepositoryModule {
+    @ViewModelScoped
+    @Provides
+    fun provideUserRepository(api: UserApi, db: UserDao): UserRepository =
+        UserRepository(api, db)
+}
+```
+
+**Qualifier：同类型多实例绑定**
+
+```kotlin
+@Qualifier
+@Retention(AnnotationRetention.BINARY)
+annotation class AuthOkHttp  // 带认证的 OkHttpClient
+
+@Qualifier
+@Retention(AnnotationRetention.BINARY)
+annotation class LoggingOkHttp  // 带日志的 OkHttpClient
+
+@Module
+@InstallIn(SingletonComponent::class)
+object HttpClientModule {
+    @AuthOkHttp
+    @Singleton
+    @Provides
+    fun provideAuthClient(): OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor(AuthInterceptor())
+        .build()
+
+    @LoggingOkHttp
+    @Singleton
+    @Provides
+    fun provideLoggingClient(): OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor(HttpLoggingInterceptor())
+        .build()
+}
+
+// 使用
+class MyRepository @Inject constructor(
+    @AuthOkHttp private val authClient: OkHttpClient,
+    @LoggingOkHttp private val loggingClient: OkHttpClient
+)
+```
+
+**Compose 中的 Hilt**
+
+```kotlin
+@AndroidEntryPoint
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            val viewModel: MainViewModel = hiltViewModel()  // Compose 内获取
+            MainScreen(viewModel)
+        }
+    }
+}
+```
+
+**Hilt vs Koin：如何选型**
+
+| 维度 | Hilt | Koin |
+|------|------|------|
+| 实现方式 | 编译时注解处理器（APT），基于 Dagger | 运行时 DSL 注册 + 反射/ServiceLoader |
+| 错误发现 | 编译时报错 | 运行时崩溃 |
+| 性能 | 零运行时开销（生成代码） | 有轻微运行时开销 |
+| 学习成本 | 高（注解、Component、Scope） | 低（纯 Kotlin DSL） |
+| 适合规模 | 中大型项目 | 中小型项目、KMP 项目 |
+| KMP 支持 | 有限（Android 为主） | 原生支持 KMP |
+| 编译速度 | 较慢（注解处理） | 快 |
 
 #### 2.4.2 MVI 架构详解
 
@@ -791,6 +1260,8 @@ Zygote fork 进程
 **hprof 分析**
 - MAT：Dominator Tree 查看大对象，GC Root 分析引用链
 - Android Studio Profiler：直接查看对象分配和引用
+
+---
 
 ## 三、框架层
 
@@ -1161,11 +1632,270 @@ jobs:
 
 ---
 
-## 五、性能优化体系
+## 五、测试体系
 
-### 5.1 稳定性治理
+> 测试不是"写完代码再补"的事后工作，而是架构设计的一部分。Google 官方架构指南将测试列为 Android 开发的三大支柱之一（架构、测试、性能）。
 
-#### 5.1.1 Crash 治理
+### 5.1 测试金字塔
+
+```
+         /\
+        /E2E\       极少，验证关键用户路径（如完成购买流程）
+       /------\
+      /  集成  \     中等，验证多模块协作（如 DB + Network + Repository）
+     /----------\
+    /   单元测试  \   最多，快速反馈，验证单个类或函数
+   /--------------\
+```
+
+**各层职责与工具**
+
+| 层级 | 验证内容 | 推荐工具 | 执行速度 |
+|------|---------|---------|---------|
+| 单元测试 | 单个函数/类的逻辑正确性 | JUnit5 + MockK + Turbine | 毫秒级 |
+| 集成测试 | 多组件协作（Room + DAO、Retrofit + 拦截器） | Room 内存数据库、MockWebServer | 秒级 |
+| UI 测试 | 用户可见的行为（点击、滑动、导航） | ComposeTestRule / Espresso | 秒-分钟级 |
+| E2E 测试 | 完整用户场景 | UIAutomator / Maestro | 分钟级 |
+
+**70/20/10 法则**：70% 单元测试、20% 集成测试、10% E2E。
+
+### 5.2 单元测试
+
+#### JUnit5 + MockK 实战
+
+```kotlin
+// 被测类
+class UserRepository(
+    private val api: UserApi,
+    private val db: UserDao
+) {
+    suspend fun getUser(id: String): User {
+        // 先读缓存
+        val cached = db.getUser(id)
+        if (cached != null) return cached
+        // 缓存未命中，请求网络
+        val user = api.getUser(id)
+        db.insertUser(user)
+        return user
+    }
+}
+
+// 测试类
+class UserRepositoryTest {
+    @MockK
+    private lateinit var api: UserApi
+
+    @MockK
+    private lateinit var db: UserDao
+
+    private lateinit var repository: UserRepository
+
+    @BeforeEach
+    fun setUp() {
+        MockKAnnotations.init(this)
+        repository = UserRepository(api, db)
+    }
+
+    @Test
+    fun `getUser returns cached user when available`() = runTest {
+        val cachedUser = User(id = "1", name = "Cached")
+        coEvery { db.getUser("1") } returns cachedUser
+
+        val result = repository.getUser("1")
+
+        assertEquals(cachedUser, result)
+        coVerify(exactly = 0) { api.getUser(any()) }  // 确认没调网络
+    }
+
+    @Test
+    fun `getUser fetches from network when cache miss`() = runTest {
+        val apiUser = User(id = "1", name = "Fetched")
+        coEvery { db.getUser("1") } returns null
+        coEvery { api.getUser("1") } returns apiUser
+        coEvery { db.insertUser(apiUser) } just runs
+
+        val result = repository.getUser("1")
+
+        assertEquals(apiUser, result)
+        coVerify { api.getUser("1") }
+        coVerify { db.insertUser(apiUser) }
+    }
+}
+```
+
+**关键要点**
+- `runTest` 提供测试用协程作用域，自动跳过延迟，不依赖真实时间
+- `@MockK` + `coEvery` 模拟协程函数，`coVerify` 验证调用行为
+- 测试方法名应描述行为而非实现（如 `getUser returns cached user when available`）
+- 每个测试只验证一个行为路径
+
+#### Flow 测试（Turbine）
+
+```kotlin
+@Test
+fun `Flow emits data when database changes`() = runTest {
+    val userFlow = MutableStateFlow(User("1", "Old"))
+    coEvery { db.observeUser("1") } returns userFlow
+
+    repository.observeUser("1").test {
+        // 初始值
+        assertEquals(User("1", "Old"), awaitItem())
+        // 模拟数据变更
+        userFlow.value = User("1", "New")
+        assertEquals(User("1", "New"), awaitItem())
+        // 取消订阅
+        cancelAndIgnoreRemainingEvents()
+    }
+}
+```
+- Turbine 专为 Flow 测试设计，`test { }` 块内按顺序 `awaitItem()` 消费发射值
+- `cancelAndIgnoreRemainingEvents()` 告诉 Turbine 剩余事件不重要，避免测试因未消费事件而失败
+
+#### TestDispatcher 与主线程调度
+
+```kotlin
+@OptIn(ExperimentalCoroutinesApi::class)
+class MainDispatcherRule : TestWatcher() {
+    val testDispatcher = UnconfinedTestDispatcher()
+
+    override fun starting(description: Description) {
+        Dispatchers.setMain(testDispatcher)
+    }
+
+    override fun finished(description: Description) {
+        Dispatchers.resetMain()
+    }
+}
+```
+- 替换 `Dispatchers.Main` 为 `UnconfinedTestDispatcher`，避免测试中主线程限制
+- 使用 `TestWatcher` 自动管理生命周期（`@get:Rule` 在 JUnit4 中）
+
+### 5.3 UI 测试
+
+#### Compose UI Test
+
+```kotlin
+class CounterScreenTest {
+    @get:Rule
+    val composeTestRule = createComposeRule()
+
+    @Test
+    fun counter_increments_when_button_clicked() {
+        composeTestRule.setContent {
+            CounterScreen()  // Composable 函数
+        }
+
+        // 断言初始状态
+        composeTestRule.onNodeWithText("Count: 0").assertExists()
+
+        // 点击按钮
+        composeTestRule.onNodeWithText("Increment").performClick()
+
+        // 断言状态变更
+        composeTestRule.onNodeWithText("Count: 1").assertExists()
+    }
+
+    @Test
+    fun list_displays_items_from_viewmodel() {
+        val fakeRepository = FakeUserRepository().apply {
+            users = listOf(User("1", "Alice"), User("2", "Bob"))
+        }
+        composeTestRule.setContent {
+            UserListScreen(userRepository = fakeRepository)
+        }
+
+        composeTestRule.onNodeWithText("Alice").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Bob").assertIsDisplayed()
+    }
+}
+```
+
+**查找器语义（Semantics）**
+- Compose 通过语义树（Semantics Tree）定位元素，不是 View ID
+- `onNodeWithText()` / `onNodeWithTag()` / `onNode(hasContentDescription(...))`
+- 自定义 Composable 应添加 `Modifier.semantics { contentDescription = "..." }` 提高可测试性
+
+#### 等待与异步
+
+```kotlin
+// 等待条件满足
+composeTestRule.waitUntil(timeoutMillis = 5000) {
+    composeTestRule.onAllNodesWithText("Loaded").fetchSemanticsNodes().isNotEmpty()
+}
+
+// 等待空闲（所有重组和动画完成）
+composeTestRule.waitForIdle()
+```
+
+### 5.4 截图测试（Snapshot Testing）
+
+截图测试捕获 Composables 的像素级输出，防止意外的 UI 回归。
+
+**Roborazzi（推荐）**
+
+```kotlin
+class UserCardScreenshotTest {
+    @get:Rule
+    val composeTestRule = createComposeRule()
+
+    @Test
+    fun captureUserCard() {
+        composeTestRule.setContent {
+            UserCard(user = User("Alice", "alice@example.com"))
+        }
+
+        // 截图并对比，输出路径：build/outputs/roborazzi/
+        composeTestRule
+            .onRoot()
+            .captureRoboImage("src/test/screenshots/UserCard.png")
+    }
+}
+```
+- 首次运行生成基准截图
+- 后续运行自动对比像素差异
+- 差异图保存在 `build/outputs/roborazzi/`，可直接查看
+
+### 5.5 假数据策略（Fakes vs Mocks）
+
+| 方式 | 适用场景 | 示例 |
+|------|---------|------|
+| **Mock（MockK）** | 验证行为交互（是否调用、调用次数） | 验证 Repository 调用了 API |
+| **Fake** | 需要真实行为的测试 | FakeUserRepository 用内存 Map 模拟数据库 |
+| **Stub** | 只返回预设数据 | 固定返回值的简单场景 |
+
+```kotlin
+// Fake：行为接近真实实现，可在多个测试间复用
+class FakeUserDao : UserDao {
+    private val users = mutableMapOf<String, User>()
+
+    override suspend fun insertUser(user: User) {
+        users[user.id] = user
+    }
+
+    override suspend fun getUser(id: String): User? = users[id]
+}
+
+// Fake 的优势
+// 1. 可复用：一套 Fake 用于多个测试类
+// 2. 状态隔离：每个测试创建新 Fake 实例，无污染
+// 3. 行为真实：插入后再查询能检查到，不需要 coEvery 逐一配置
+```
+
+### 5.6 测试最佳实践
+
+- **F.I.R.S.T 原则**：Fast（快）、Independent（独立）、Repeatable（可重复）、Self-validating（自验证）、Timely（及时）
+- **不在测试中创建真实网络连接**：用 MockWebServer 或 MockK
+- **Room 测试用内存数据库**：`Room.inMemoryDatabaseBuilder()`
+- **避免测试实现细节**：测试行为而非内部状态变量名
+- **CI 中运行测试**：`./gradlew test` + `./gradlew connectedAndroidTest`
+
+---
+
+## 六、性能优化体系
+
+### 6.1 稳定性治理
+
+#### 6.1.1 Crash 治理
 
 **Java Crash 捕获**
 ```kotlin
@@ -1193,7 +1923,7 @@ class MyApplication : Application() {
 - Java Crash 率：< 0.1%（千分之一）
 - Native Crash 率：< 0.05%（万分之五）
 
-#### 5.1.2 ANR 分析
+#### 6.1.2 ANR 分析
 
 **ANR 类型**
 - InputDispatching：输入事件未在 5 秒内处理完毕
@@ -1218,9 +1948,9 @@ class MyApplication : Application() {
 
 ---
 
-### 5.2 内存管理原理与高级优化
+### 6.2 内存管理原理与高级优化
 
-#### 5.2.1 GC 原理
+#### 6.2.1 GC 原理
 
 **ART GC 算法**
 - Concurrent Copying：并发复制，暂停时间短
@@ -1237,7 +1967,7 @@ class MyApplication : Application() {
 - 小对象在 TLAB 中分配，无需同步
 - 大对象直接分配在堆中，需要同步
 
-#### 5.2.2 Native Heap 分析
+#### 6.2.2 Native Heap 分析
 
 **Native 内存泄漏检测**
 - malloc debug：通过系统属性开启 Native 内存调试
@@ -1249,7 +1979,7 @@ class MyApplication : Application() {
 - Native 线程创建未销毁
 - 第三方 Native 库内存泄漏
 
-#### 5.2.3 内存抖动
+#### 6.2.3 内存抖动
 
 **什么是内存抖动？**
 - 短时间内频繁创建和销毁对象
@@ -1266,9 +1996,9 @@ class MyApplication : Application() {
 
 ---
 
-### 5.3 卡顿优化体系
+### 6.3 卡顿优化体系
 
-#### 5.3.1 掉帧监控
+#### 6.3.1 掉帧监控
 
 **FrameCallback 实现**
 ```kotlin
@@ -1306,7 +2036,7 @@ class FpsMonitor {
 }
 ```
 
-#### 5.3.2 布局优化
+#### 6.3.2 布局优化
 
 **布局层级优化**
 - 使用 ConstraintLayout 减少嵌套层级
@@ -1325,9 +2055,9 @@ class FpsMonitor {
 
 ---
 
-### 5.4 网络优化
+### 6.4 网络优化
 
-#### 5.4.1 HTTPDNS
+#### 6.4.1 HTTPDNS
 
 **为什么需要 HTTPDNS？**
 - 传统 DNS 解析存在劫持风险（运营商劫持、DNS 污染）
@@ -1364,7 +2094,7 @@ class HttpDnsInterceptor : Interceptor {
 }
 ```
 
-#### 5.4.2 弱网优化
+#### 6.4.2 弱网优化
 
 **超时策略**
 - 连接超时：5-10 秒
@@ -1383,9 +2113,9 @@ class HttpDnsInterceptor : Interceptor {
 
 ---
 
-### 5.5 包体积优化
+### 6.5 包体积优化
 
-#### 5.5.1 代码混淆
+#### 6.5.1 代码混淆
 
 **ProGuard 规则**
 ```proguard
@@ -1413,7 +2143,7 @@ class HttpDnsInterceptor : Interceptor {
 - 开启 R8 全量模式：`android.enableR8.fullMode=true`
 - 更激进的优化：类合并、方法内联、未使用代码移除
 
-#### 5.5.2 资源优化
+#### 6.5.2 资源优化
 
 **图片压缩**
 - WebP：有损/无损压缩，比 PNG 小 25-35%
@@ -1430,11 +2160,153 @@ class HttpDnsInterceptor : Interceptor {
 
 ---
 
-## 六、跨平台与新技术
+### 6.6 Baseline Profiles 与启动加速
 
-### 6.1 Compose Multiplatform
+Baseline Profiles 是 AGP 7.0+ 引入的 AOT 编译优化，可显著提升应用首次启动和页面打开速度。
 
-#### 6.1.1 声明式 UI 原理
+**原理**
+
+```
+Cloud Profiles → APK 内置 baseline-prof.txt
+        ↓
+Dex2oat AOT 编译 → 关键代码路径提前编译为机器码
+        ↓
+启动时跳过 JIT 解释 → 启动速度提升 20-40%
+```
+
+**生成步骤**
+
+```kotlin
+// 1. 创建基准配置文件生成器
+@RunWith(AndroidJUnit4::class)
+class BaselineProfileGenerator {
+    @get:Rule
+    val rule = BaselineProfileRule()
+
+    @Test
+    fun generate() = rule.collect(packageName = "com.example.app") {
+        pressHome()
+        // 遍历关键用户路径（冷启动 → 首页 → 详情页）
+        startActivityAndWait()
+        device.findObject(By.text("详情")).click()
+        device.waitForIdle()
+    }
+}
+
+// 2. 运行：./gradlew :app:generateBaselineProfile
+// 3. 输出：app/src/main/baseline-prof.txt 纳入版本控制
+```
+
+**Macrobenchmark 测量**
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class StartupBenchmark {
+    @get:Rule
+    val rule = MacrobenchmarkRule()
+
+    @Test
+    fun measureColdStart() = rule.measureRepeated(
+        packageName = "com.example.app",
+        metrics = listOf(StartupTimingMetric()),
+        iterations = 5,
+        setupBlock = {
+            pressHome()
+            // 每个迭代前杀死进程模拟冷启动
+        }
+    ) {
+        startActivityAndWait()
+    }
+}
+```
+
+**关键指标**
+
+| 指标 | 说明 | 目标值 |
+|------|------|--------|
+| `timeToInitialDisplay` | 首帧显示时间 | < 500ms |
+| `timeToFullDisplay` | 完全可交互时间 | < 1.5s |
+| `frameTimingMs` | 首帧渲染耗时分布 | P50 < 16ms |
+
+### 6.7 App Startup 初始化任务管理
+
+App Startup 替代传统 Application.onCreate() 中散乱的初始化代码，支持任务依赖图和自动拓扑排序。
+
+```kotlin
+// 定义初始化任务
+class AnalyticsInitializer : Initializer<Unit> {
+    override fun create(context: Context) {
+        // 初始化 Firebase Analytics
+        Firebase.analytics.setAnalyticsCollectionEnabled(true)
+    }
+
+    override fun dependencies(): List<Class<out Initializer<*>>> {
+        // 依赖其他初始化任务先完成
+        return listOf()
+    }
+}
+
+class CrashInitializer : Initializer<Unit> {
+    override fun create(context: Context) {
+        // 初始化崩溃收集
+        Thread.setDefaultUncaughtExceptionHandler { _, e -> saveCrash(e) }
+    }
+
+    override fun dependencies(): List<Class<out Initializer<*>>> {
+        return listOf()  // 无依赖，可与 Analytics 并行
+    }
+}
+```
+
+**注册（AndroidManifest.xml 或 Provider 自动发现）**
+
+```xml
+<provider
+    android:name="androidx.startup.InitializationProvider"
+    android:authorities="${applicationId}.androidx-startup"
+    android:exported="false"
+    tools:node="merge">
+    <meta-data
+        android:name="com.example.AnalyticsInitializer"
+        android:value="androidx.startup" />
+    <meta-data
+        android:name="com.example.CrashInitializer"
+        android:value="androidx.startup" />
+</provider>
+```
+
+**延迟初始化**
+
+```kotlin
+// 非启动必备的初始化，标记为手动
+class CacheWarmInitializer : Initializer<Unit> {
+    override fun create(context: Context) { ... }
+    override fun dependencies() = listOf()
+
+    // 不自动初始化
+}
+
+// 按需手动初始化
+AppInitializer.getInstance(context)
+    .initializeComponent(CacheWarmInitializer::class.java)
+```
+
+**对比传统方式**
+
+| 维度 | 传统 Application.onCreate() | App Startup |
+|------|---------------------------|-------------|
+| 执行顺序 | 手动控制（容易遗漏依赖） | 自动拓扑排序 |
+| 并行初始化 | 需手动线程管理 | 自动识别无依赖任务并行执行 |
+| 延迟初始化 | 需自己判断 | 原生支持按需加载 |
+| 可测试性 | 难以单独测试 | 每个 Initializer 可独立测试 |
+
+---
+
+## 七、跨平台与新技术
+
+### 7.1 Compose Multiplatform
+
+#### 7.1.1 声明式 UI 原理
 
 **重组（Recomposition）**
 - 当状态变化时，Compose 重新执行可组合函数
@@ -1489,7 +2361,7 @@ fun Counter(count: Int, onIncrement: () -> Unit) {
 - rememberCoroutineScope：获取组合感知的协程作用域
 - snapshotFlow：将 Compose 状态转换为 Flow
 
-#### 6.1.2 跨平台渲染
+#### 7.1.2 跨平台渲染
 
 **Android 平台**
 - Compose 基于 View 系统
@@ -1503,14 +2375,213 @@ fun Counter(count: Int, onIncrement: () -> Unit) {
 
 **Desktop 平台**
 - 基于 Skia 渲染引擎，直接与操作系统窗口交互
-- 不再基于 Swing/JavaFX（旧版 Compose for Desktop 曾基于 Swing，现已独立）
-- 使用 Skia 渲染引擎
+- 不再基于 Swing/JavaFX（旧版 Compose for Desktop 曾基于 Swing，现已独立），直接使用 Skia 渲染引擎与操作系统窗口交互
+
+#### 7.1.3 Compose 动画系统
+
+Compose 动画分为两大类：**值动画**（animate*AsState / Animatable）和**过渡动画**（Transition / AnimatedVisibility）。
+
+**animate*AsState（最简单，推荐首选）**
+
+```kotlin
+@Composable
+fun AnimatedBox(isBig: Boolean) {
+    // 值变化时自动插值过渡
+    val size by animateDpAsState(
+        targetValue = if (isBig) 100.dp else 50.dp,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)
+    )
+    val color by animateColorAsState(
+        targetValue = if (isBig) Color.Red else Color.Blue,
+        animationSpec = tween(durationMillis = 300)
+    )
+    Box(Modifier.size(size).background(color))
+}
+```
+
+**动画规格对比**
+
+| 规格 | 特点 | 适用场景 |
+|------|------|---------|
+| `spring()` | 物理弹簧，自然有弹性 | 尺寸变化、拖拽回弹 |
+| `tween()` | 线性插值，可配缓动曲线 | 颜色过渡、透明度 |
+| `keyframes()` | 关键帧控制 | 路径动画、多阶段动画 |
+| `snap()` | 瞬间切换 | 模式切换（暗黑模式） |
+| `repeatable()` | 循环重复 | 加载动画、脉冲效果 |
+
+**Animatable（精细控制）**
+
+```kotlin
+@Composable
+fun GestureAnimation() {
+    val offsetX = remember { Animatable(0f) }
+
+    Box(
+        Modifier
+            .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+            .draggable(
+                orientation = Orientation.Horizontal,
+                state = rememberDraggableState { delta ->
+                    // 拖拽时跟随手指
+                    coroutineScope.launch { offsetX.snapTo(offsetX.value + delta) }
+                },
+                onDragStopped = {
+                    // 松手后回弹到 0
+                    coroutineScope.launch {
+                        offsetX.animateTo(0f, spring())
+                    }
+                }
+            )
+    )
+}
+```
+
+**AnimatedVisibility（显示/隐藏动画）**
+
+```kotlin
+AnimatedVisibility(
+    visible = isVisible,
+    enter = fadeIn() + slideInVertically(),
+    exit = fadeOut() + slideOutVertically()
+) {
+    Text("Hello Compose")
+}
+```
+
+**Transition（多属性同步动画）**
+
+```kotlin
+enum class BoxState { Collapsed, Expanded }
+
+@Composable
+fun TransitionBox(state: BoxState) {
+    val transition = updateTransition(targetState = state, label = "box")
+
+    val size by transition.animateDp(label = "size") { s ->
+        when (s) { BoxState.Collapsed -> 50.dp; BoxState.Expanded -> 100.dp }
+    }
+    val color by transition.animateColor(label = "color") { s ->
+        when (s) { BoxState.Collapsed -> Color.Gray; BoxState.Expanded -> Color.Green }
+    }
+
+    Box(Modifier.size(size).background(color))
+}
+```
+
+#### 7.1.4 Compose Navigation
+
+Compose Navigation 2.8+ 支持类型安全的导航，无需字符串路由。
+
+```kotlin
+// 定义路由（类型安全）
+@Serializable data class Detail(val id: String, val name: String)
+@Serializable object Home
+@Serializable object Settings
+
+@Composable
+fun App() {
+    val navController = rememberNavController()
+    NavHost(navController = navController, startDestination = Home) {
+        composable<Home> {
+            HomeScreen(onNavigateToDetail = { id, name ->
+                navController.navigate(Detail(id, name))
+            })
+        }
+        composable<Detail> { backStackEntry ->
+            val detail = backStackEntry.toRoute<Detail>()  // 自动反序列化
+            DetailScreen(id = detail.id, name = detail.name)
+        }
+        composable<Settings> { SettingsScreen() }
+    }
+}
+```
+
+**Deep Link**
+
+```kotlin
+composable<Detail>(
+    deepLinks = listOf(navDeepLink<Detail>(basePath = "myapp://detail"))
+) { ... }
+```
+
+**多返回栈（Bottom Navigation 必备）**
+
+```kotlin
+@Composable
+fun MainScreen() {
+    val navController = rememberNavController()
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                // 使用 saveState + restoreState 保留各 Tab 的返回栈
+                listOf(Tab.Home, Tab.Profile, Tab.Settings).forEach { tab ->
+                    NavigationBarItem(
+                        selected = currentTab == tab,
+                        onClick = {
+                            navController.navigate(tab.route) {
+                                popUpTo(navController.graph.findStartDestination().id) {
+                                    saveState = true   // 离开时保存状态
+                                }
+                                launchSingleTop = true
+                                restoreState = true    // 回来时恢复状态
+                            }
+                        }
+                    )
+                }
+            }
+        }
+    ) { ... }
+}
+```
+
+#### 7.1.5 Compose 性能诊断
+
+**重组计数（Layout Inspector）**
+
+Android Studio → Layout Inspector → 勾选 "Show Recomposition Counts"，可看到哪些组件被频繁重组，用颜色标注（红=高频）。
+
+**常见性能陷阱与修复**
+
+| 问题 | 表现 | 修复方案 |
+|------|------|---------|
+| 不稳定参数 | 参数未变但组件重组 | 用 `@Stable`/`@Immutable` 注解，或用 `kotlinx-collections-immutable` |
+| Lambda 频繁重建 | `remember` 的 lambda 每次重组都是新对象 | 用 `remember { }` 包裹 lambda，或用函数引用 `::method` |
+| 大列表无 key | 列表项全部重建 | 给 `LazyColumn items` 加 `key` 参数 |
+| 过度使用 `derivedStateOf` | 过度重组与性能损耗 | 只在需要"跳过中间状态"时使用，普通计算直接用 `remember` |
+| Modifier 顺序错误 | 点击/测量性能下降 | `clickable` 放前面，`size`/`padding` 放后面 |
+| 在 Composable 中做耗时计算 | 每帧都重新计算 | 用 `remember` 记忆化，或用 `LaunchedEffect` + 后台线程 |
+
+**derivedStateOf 的正确用法**
+
+```kotlin
+// 场景：列表滚动时，只在"超过阈值"的瞬间触发重组，而非每次滚动都重组
+val showButton by remember {
+    derivedStateOf { listState.firstVisibleItemIndex > 0 }
+}
+// 只在 showButton 的值（true/false）改变时才重组
+// 而 listState.firstVisibleItemIndex 每次变化不会直接触发重组
+```
+
+**Phases（理解跳过机制的前提）**
+
+```
+Composition  →  Layout  →  Drawing
+（执行 Composable） （测量+摆放） （绘制）
+       ↓                ↓           ↓
+    可跳过条件：      不影响跳过    不影响跳过
+    - 参数 equals 为 true
+    - 参数为稳定类型
+```
+
+- 只有 **Composition 阶段**可以跳过（Skip）
+- 状态读取在 Composition 阶段进行
+- 把状态读取推迟到 Layout/Drawing 阶段（使用 `Modifier.layout` 中的 lambda）可减少重组范围
 
 ---
 
-### 6.2 Kotlin Multiplatform
+### 7.2 Kotlin Multiplatform
 
-#### 6.2.1 expect/actual 机制
+#### 7.2.1 expect/actual 机制
 
 ```kotlin
 // commonMain
@@ -1525,7 +2596,7 @@ actual fun getPlatformName(): String = "iOS ${UIDevice.currentDevice.systemVersi
 
 > **Kotlin 2.1+ 新变化**：KMP 引入了新的 `@Expect` / `@Actual` 注解作为实验性功能，未来将替代旧的 `expect`/`actual` 关键字声明方式，提供更好的 IDE 支持和类型检查。
 
-#### 6.2.2 共享逻辑层
+#### 7.2.2 共享逻辑层
 
 **网络层共享**
 - Ktor：跨平台 HTTP 客户端
@@ -1556,9 +2627,9 @@ com.example.app/
 
 ---
 
-### 6.3 AI 与端侧模型
+### 7.3 AI 与端侧模型
 
-#### 6.3.1 Google ML Kit
+#### 7.3.1 Google ML Kit
 
 **功能**
 - 文本识别：OCR 识别
@@ -1581,7 +2652,7 @@ recognizer.process(image)
     }
 ```
 
-#### 6.3.2 Google AI Edge (替代 TensorFlow Lite)
+#### 7.3.2 Google AI Edge (替代 TensorFlow Lite)
 
 > Google 已推出 **AI Edge** 作为 TFLite 的下一代演进方案，提供更好的模型管理和硬件加速支持。
 
@@ -1620,7 +2691,7 @@ val maxIndex = output[0].indices.maxByOrNull { output[0][it] }
 - NNAPI：使用 NPU/DSP 加速
 - XNNPACK：CPU 推理加速库
 
-#### 6.3.3 大语言模型 (LLM) 端侧部署
+#### 7.3.3 大语言模型 (LLM) 端侧部署
 
 **Gemini Nano（Android 内置）**
 - Android 14+ 内置 Gemini Nano，通过 AI Core 服务提供端侧大模型能力
@@ -1643,11 +2714,81 @@ aiCore.generateContent(prompt) { response ->
 
 ---
 
-## 七、安全与合规
+### 7.4 现代 Android 特性（Android 13+）
 
-### 7.1 数据安全
+#### Per-app Language（应用内语言切换）
 
-#### 7.1.1 加密体系
+Android 13+ 支持用户为每个应用单独设置语言，无需修改系统语言。
+
+```kotlin
+// 获取 LocaleManager
+val localeManager = context.getSystemService(LocaleManager::class.java)
+
+// 设置应用语言
+localeManager.applicationLocales = LocaleList.forLanguageTags("zh-CN")
+
+// 读取当前语言
+val currentLocales = localeManager.applicationLocales  // [zh-CN]
+
+// 监听语言变化
+val receiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        // 系统语言/应用语言变化时触发，需重建 Activity
+        recreate()
+    }
+}
+context.registerReceiver(receiver, IntentFilter(Intent.ACTION_LOCALE_CHANGED))
+```
+
+- 应用重启自动恢复上次设置的语言
+- 支持多语言列表（fallback 机制）
+
+#### Photo Picker（照片选择器）
+
+Android 13+ 提供系统级 Photo Picker，替代 `READ_EXTERNAL_STORAGE` 权限。
+
+```kotlin
+// 单选照片（无需任何权限声明）
+val pickMedia = registerForActivityResult(PickVisualMedia()) { uri ->
+    if (uri != null) {
+        imageView.setImageURI(uri)
+    }
+}
+pickMedia.launch(PickVisualMediaRequest(PickVisualMedia.ImageOnly))
+
+// 多选照片（最多 5 张）
+val pickMultipleMedia = registerForActivityResult(
+    PickMultipleVisualMedia(5)
+) { uris -> /* 处理多张照片 */ }
+```
+
+**对比传统方式**
+
+| 维度 | 传统 `READ_EXTERNAL_STORAGE` | Photo Picker |
+|------|----------------------------|-------------|
+| 权限 | 需要运行时权限 | 无需任何权限 |
+| UI | 需自己实现 | 系统级 UI，体验一致 |
+| 访问范围 | 整个外部存储 | 用户选择的媒体 |
+| 文件类型 | 任意文件 | 照片/视频 |
+| 版本 | 所有版本 | Android 13+（Google Play Services 可回退到 11+） |
+
+#### 每应用语言 + 照片选择器回退兼容
+
+```kotlin
+// Google Play Services 为 Photo Picker 提供回退支持
+dependencies {
+    implementation("androidx.activity:activity:1.9+")
+    // 自动通过 Play Services 在 Android 11-12 上提供 Photo Picker
+}
+```
+
+---
+
+## 八、安全与合规
+
+### 8.1 数据安全
+
+#### 8.1.1 加密体系
 
 **对称加密 AES-GCM**
 ```kotlin
@@ -1673,7 +2814,7 @@ fun decrypt(data: ByteArray, key: SecretKey): ByteArray {
 - SM3：哈希算法，替代 SHA-256
 - SM4：对称加密，替代 AES
 
-#### 7.1.2 安全存储
+#### 8.1.2 安全存储
 
 **EncryptedSharedPreferences**
 ```kotlin
@@ -1696,9 +2837,9 @@ val sharedPreferences = EncryptedSharedPreferences.create(
 
 ---
 
-### 7.2 网络安全
+### 8.2 网络安全
 
-#### 7.2.1 SSL Pinning
+#### 8.2.1 SSL Pinning
 
 ```kotlin
 // OkHttp CertificatePinner
@@ -1716,7 +2857,7 @@ val client = OkHttpClient.Builder()
 - 即使 CA 被攻破，也能保证连接安全
 - 企业内网环境自定义证书
 
-#### 7.2.2 隐私合规
+#### 8.2.2 隐私合规
 
 **GDPR 要求**
 - 数据最小化：只收集必要的数据
@@ -1730,11 +2871,11 @@ val client = OkHttpClient.Builder()
 
 ---
 
-## 八、系统底层与内核
+## 九、系统底层与内核
 
-### 8.1 Linux 内核基础
+### 9.1 Linux 内核基础
 
-#### 8.1.1 进程调度
+#### 9.1.1 进程调度
 
 **CFS 完全公平调度器**
 - 每个进程分配虚拟运行时间（vruntime）
@@ -1746,7 +2887,7 @@ val client = OkHttpClient.Builder()
 - 内存限制：memory.limit_in_bytes
 - IO 限制：blkio.throttle
 
-#### 8.1.2 内存管理
+#### 9.1.2 内存管理
 
 **LMK（Low Memory Killer）**
 - 根据 oom_score_adj 评分选择杀死的进程
@@ -1761,9 +2902,9 @@ val client = OkHttpClient.Builder()
 
 ---
 
-### 8.2 图形渲染管线
+### 9.2 图形渲染管线
 
-#### 8.2.1 SurfaceFlinger 与硬件合成器 (HWC)
+#### 9.2.1 SurfaceFlinger 与硬件合成器 (HWC)
 
 > 关于 SurfaceFlinger 的基础合成策略，请参考 [3.4.2 SurfaceFlinger 合成](#342-surfaceflinger-合成) 章节。
 
@@ -1772,7 +2913,7 @@ val client = OkHttpClient.Builder()
 - HWC 1.4：支持图层压缩
 - HWC 2.0：虚拟显示、客户端合成
 
-#### 8.2.2 Vsync 同步机制
+#### 9.2.2 Vsync 同步机制
 
 > 关于 Triple Buffer 的原理，请参考 [3.4.2 SurfaceFlinger 合成](#342-surfaceflinger-合成) 章节。
 
@@ -1783,11 +2924,11 @@ val client = OkHttpClient.Builder()
 
 ---
 
-## 九、架构师软技能与工程管理
+## 十、架构师软技能与工程管理
 
-### 9.1 技术选型方法论
+### 10.1 技术选型方法论
 
-#### 9.1.1 选型评估矩阵
+#### 10.1.1 选型评估矩阵
 
 **评估维度**
 - 功能完整性：是否满足业务需求
@@ -1803,7 +2944,7 @@ val client = OkHttpClient.Builder()
 4. 稳定性测试
 5. 团队评估
 
-#### 9.1.2 技术决策记录（ADR）
+#### 10.1.2 技术决策记录（ADR）
 
 ```markdown
 # ADR-001：选择 MVI 架构
@@ -1828,9 +2969,9 @@ val client = OkHttpClient.Builder()
 - 负面：学习成本增加，状态类膨胀
 ```
 
-### 9.2 架构演进策略
+### 10.2 架构演进策略
 
-#### 9.2.1 渐进式重构
+#### 10.2.1 渐进式重构
 
 **防腐层（Anti-Corruption Layer）**
 - 在新旧系统之间建立适配层
@@ -1864,9 +3005,9 @@ if (FeatureToggle.isEnabled("new_home_page")) {
 }
 ```
 
-### 9.3 团队效能
+### 10.3 团队效能
 
-#### 9.3.1 研发流程优化
+#### 10.3.1 研发流程优化
 
 **敏捷开发实践**
 - Scrum：2 周一迭代
@@ -1879,7 +3020,7 @@ if (FeatureToggle.isEnabled("new_home_page")) {
 - 方案包含：架构图、数据流、接口定义
 - 团队评审通过后才能开发
 
-#### 9.3.2 Code Review 清单
+#### 10.3.2 Code Review 清单
 
 **必查项**
 - 是否有内存泄漏风险
@@ -1893,9 +3034,9 @@ if (FeatureToggle.isEnabled("new_home_page")) {
 - Ktlint：Kotlin 代码格式检查
 - SpotBugs：Java 字节码分析
 
-### 9.4 技术债务管理
+### 10.4 技术债务管理
 
-#### 9.4.1 债务量化
+#### 10.4.1 债务量化
 
 **SonarQube 指标**
 - 代码复杂度：圈复杂度
@@ -1903,7 +3044,7 @@ if (FeatureToggle.isEnabled("new_home_page")) {
 - 测试覆盖率：单元测试覆盖
 - 技术债务：修复所有问题所需时间
 
-#### 9.4.2 偿还优先级
+#### 10.4.2 偿还优先级
 
 **评估维度**
 - 影响范围：影响多少用户/功能
@@ -1929,18 +3070,18 @@ if (FeatureToggle.isEnabled("new_home_page")) {
 
 ### P6 高级工程师
 - 核心能力：独立负责功能/模块
-- 知识覆盖：第一章 + 第二章 中高级篇
-- 学习重点：自定义 View、网络编程、Jetpack（Lifecycle/ViewModel/DataStore/Room）、架构模式（MVVM/MVI）、性能优化
+- 知识覆盖：第一章 + 第二章 + 第五章（测试基础）
+- 学习重点：自定义 View、网络编程、Jetpack（Lifecycle/ViewModel/DataStore/Room）、架构模式（MVVM/MVI）、性能优化、单元测试编写
 
 ### P7 资深工程师
 - 核心能力：技术攻坚/性能优化/架构设计
-- 知识覆盖：第一章 + 第二章 + 第三章 框架层
-- 学习重点：Binder、Handler、AMS/WMS、插件化、编译构建、Gradle 工程化、稳定性治理
+- 知识覆盖：第一章 + 第二章 + 第三章 + 第五章（测试体系）
+- 学习重点：Binder、Handler、AMS/WMS、编译构建、Gradle 工程化、稳定性治理、UI 测试与截图测试
 
 ### P8 架构师
 - 核心能力：技术规划/架构演进/团队赋能
 - 知识覆盖：全部章节
-- 学习重点：架构设计、性能体系、跨平台（KMP/Compose Multiplatform）、安全合规、AI 端侧部署、软技能
+- 学习重点：架构设计、性能体系、跨平台（KMP/Compose Multiplatform）、安全合规、AI 端侧部署、测试策略、软技能
 
 ## 附录 B：推荐学习资源
 
