@@ -5,11 +5,33 @@
 >
 > **版本说明**：本文档持续跟进 Android 官方最新推荐实践。当前覆盖 Android 15 (API 35) 及 Jetpack 最新稳定版。
 
----
+
 
 ## 一、基础篇
 
 ### 1.1 Java 核心
+
+日常开发与大厂面试不仅看 AOSP，Java 基础是决定技术天花板的根基。
+
+**官方最权威可用的开发文档/规范**：
+
+- [Oracle Java 官方文档 (Java SE 17+)](https://docs.oracle.com/en/java/javase/17/) — 针对 Android 开发目前主流的现代 Java 特性查阅。
+- [Google Java 编程风格指南](https://google.github.io/styleguide/javaguide.html) — 团队规范的底层基石。
+
+**中高级面试及开发必须通过官方文档补强的【核心盲区清单】**：
+
+1. **Java 内存模型 (JMM) 与多线程并发**：
+   - 重点查阅 `volatile` 的可见性与内存屏障（Memory Barrier）原理。
+   - 深入 `synchronized` 关键字在 JVM/ART 中的**锁升级**机制（偏向锁 → 轻量级锁 → 重量级锁）。
+   - 剖析并发核心 `AQS` (AbstractQueuedSynchronizer) 的独占与共享模式。
+
+2. **泛型擦除与原生局限**：
+   - 理解 Java 泛型在编译期的**类型擦除（Type Erasure）**，以及为什么 `List<String>` 和 `List<Integer>` 在运行时是同一个 Class。
+   - 掌握通配符上下界 `<? extends T>` (PECS 原则：Producer Extends, Consumer Super)。
+
+3. **JVM/ART 内存分配与 GC 机制**：
+   - 理解 ART 虚拟机的并发垃圾回收（Concurrent GC）与分代收集算法。
+   - 搞清 强、软、弱、虚 四种引用的生命周期，以及它们在内存屏障/GC 触发时的真实表现。
 
 #### 1.1.1 HashMap 源码与原理
 
@@ -86,6 +108,27 @@ public static Object newProxyInstance(ClassLoader loader,
 ---
 
 ### 1.2 Kotlin 核心
+
+Kotlin 绝非简单的"Java 语法糖"，熟练掌握 Kotlin 字节码和底层协程机制是区分中高级 Android 的分水岭。
+
+**官方最权威可用的开发文档**：
+
+- [Kotlin 官方语言参考文档 (Kotlin Docs)](https://kotlinlang.org/docs/home.html) — 包含最新的 Kotlin 2.x 语法标准。
+- [Kotlin 官方协程指南 (Coroutines Guide)](https://kotlinlang.org/docs/coroutines-overview.html) — 异步、流（Flow）的最权威技术源头。
+
+**中高级面试及开发必须通过官方文档补强的【核心盲区清单】**：
+
+1. **Kotlin 独有语法的"Java 反编译本质"**：
+   - **内联函数 (`inline`)**：通过查阅文档，搞清它如何消除 Lambda 的匿名内部类对象开销，以及 `noinline` 和 `crossinline` 的边界。
+   - **扩展函数 (`Extension Functions`)**：明白其本质是 Java 的 `public static final` 静态方法，且属于静态分派（不支持运行时多态）。
+   - **伴生对象 (`companion object`)**：认清其作为单例对象的内存开销，避免滥用。
+
+2. **协程的 CPS 变换与状态机原理**：
+   - 重点理解 `suspend` 关键字。官方文档中提到的"挂起不阻塞线程"，在底层是靠编译器将函数改写为 **CPS（Continuation-Passing Style）** 并利用**状态机**实现断点恢复的。
+
+3. **现代数据流处理 (Flow 体系)**：
+   - 深入官方指南中对 `StateFlow` (有状态、冷流转热、防抖) 与 `SharedFlow` (无状态、事件订阅) 的设计权衡。
+   - 攻克"数据倒灌"现象在不同 Flow/Channel 场景下的成因与解决方案。
 
 #### 1.2.1 协程原理深度解析
 
