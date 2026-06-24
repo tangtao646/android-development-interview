@@ -35,17 +35,13 @@
       `ContentProvider` 初始化 -> `Application.onCreate()`。这确保了 Activity 运行时环境已就绪。
 
 * **第四步：现代架构的核心“事务型落地” (Android 9.0+)**
-    * 系统不再零散发送指令，而是由 ATMS 将生命周期请求打包成一个 `ClientTransaction`（客户端事务包）一次性发给
-      App。
-    * **TransactionExecutor (事务执行器)**：App 端收到后，像状态机一样自动计算路径。例如目标是
-      Resume，它会自动在本地按顺序触发 `onCreate` -> `onStart` -> `onResume`。
-    * **最终落地**：
-        * **实例化**：`ActivityThread` 通过 `mInstrumentation.newActivity` 利用 **ClassLoader** 和 *
-          *反射**（或现代版本的 `AppComponentFactory`）创建 Activity 实例。
-        * **注入环境**：调用 `activity.attach()`，创建 `PhoneWindow` 并在其中关联 `ContextImpl`、
-          `WindowManager`、`Token` 等核心组件。
-        * **生命周期开启**：通过 `mInstrumentation` 回调 `activity.performCreate`（即 `onCreate`），随后触发
-          `setContentView` 完成布局加载。
+    * 系统不再零散发送指令，而是由 ATMS 将生命周期请求打包成一个 `ClientTransaction` 一次性发给 App。
+    * **TransactionExecutor (事务执行器)**：App 端收到后，调用 `execute()` 遍历事务。
+    * **LaunchActivityItem**：这是事务中的核心回调项。其 `execute()` 方法内部正式触发了 **`ActivityThread.handleLaunchActivity()`**。
+    * **最终落地 (performLaunchActivity)**：
+        * **实例化**：通过 `mInstrumentation.newActivity` 利用 **ClassLoader** 和 **反射** 创建 Activity 实例。
+        * **注入环境**：调用 `activity.attach()`，创建 `PhoneWindow` 并在其中关联 `ContextImpl`、`WindowManager`、`Token` 等核心组件。
+        * **生命周期开启**：通过 `mInstrumentation` 回调 `activity.performCreate`（即 `onCreate`），随后触发 `setContentView` 完成布局加载。
 
 #### 🧱 核心重构与演进追问
 
