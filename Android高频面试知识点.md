@@ -11,7 +11,8 @@
 启动 Activity 不仅仅是一个方法调用，它是**跨进程协作 (IPC)** 的巅峰体现。我们可以将核心流程分为四个阶段：
 
 * **第一步：在 App 进程内“递交申请”**
-    * 无论从 Context 还是 Activity 发起，请求最终都会收拢到应用大管家 `Instrumentation.execStartActivity`。
+    * 无论从 Context 还是 Activity 发起，请求最终都会收拢到应用大管家
+      `Instrumentation.execStartActivity`。
     * **现代演进 (Android 10+)**：核心调度逻辑从 AMS 剥离。`Instrumentation` 内部不再通过
       `IActivityManager` 发起，而是调用 **`IActivityTaskManager` (ATMS)**。系统通过
       `ActivityTaskManager.getService()` 获取该服务，将 Intent 正式移交给系统后台总管。
@@ -19,22 +20,32 @@
 * **第二步：在 SystemServer 进程内“批示与调度”**
     * **ATMS (ActivityTaskManagerService)**：作为“容器管家”率先介入，专门负责管理 Activity、Task（任务栈）和
       Display。
-    * **ActivityStarter**：作为“战略指挥官”，负责解析 Intent（如隐式匹配）、校验权限，并根据 **LaunchMode
-      ** 和 **Flags** 计算出 Activity 最终的栈坑位。
-    * **AMS (ActivityManagerService)**：若目标进程未启动，ATMS 通知 AMS。AMS 通过 `ProcessList` 利用 *
-      *LocalSocket** 向 `Zygote` 发送孵化请求，冷启动进程。
+    * **ActivityStarter**：作为“战略指挥官”，负责解析 Intent、校验权限，并根据 **LaunchMode** 计算栈位。
+    * **前置挂起 (Pause)**：若当前已有 Activity 处于 Resume 状态，系统会先通过 Binder 通知该进程执行
+      `onPause`。**注意：只有收到旧 Activity 的已暂停回执后，系统才会继续后续流程。**
+    * **AMS (ActivityManagerService)**：若目标进程未启动，ATMS 通知 AMS。AMS 通过 ProcessList
+      组装好新进程的配置参数，最终由 ZygoteProcess 内部的 LocalSocket 向 Zygote 正式发送孵化请求。
 
-* **第三步：在新 App 进程内“安家落户”**
-    * 进程创建后执行 `ActivityThread.main()`，初始化主线程 `Looper` 并开启消息循环。同时向系统 AMS
-      报到，并提供一个内嵌的 Binder 通道 —— `ApplicationThread`，作为未来接收系统生命周期指令的“耳朵”。
+* **第三步：在新 App 进程内“安家落户”与“环境初始化”**
+    * 进程创建后在自己的空间内执行 RuntimeInit。 它首先通过反射，加载目标类 `android.app.ActivityThread` 并获取其 main 方法
+    * 执行 `ActivityThread.main()`，初始化主线程 `Looper`。同时向系统 AMS 报到（
+      `attachApplication`），并提供 `ApplicationThread` 作为通信信使。
+    * **关键节点：bindApplication**：系统在启动 Activity 前，会先回调 `bindApplication`。此时会创建
+      `LoadedApk`、`ContextImpl` 和 `Instrumentation`，并依次触发 `Application.attachBaseContext()` ->
+      `ContentProvider` 初始化 -> `Application.onCreate()`。这确保了 Activity 运行时环境已就绪。
 
 * **第四步：现代架构的核心“事务型落地” (Android 9.0+)**
     * 系统不再零散发送指令，而是由 ATMS 将生命周期请求打包成一个 `ClientTransaction`（客户端事务包）一次性发给
       App。
     * **TransactionExecutor (事务执行器)**：App 端收到后，像状态机一样自动计算路径。例如目标是
       Resume，它会自动在本地按顺序触发 `onCreate` -> `onStart` -> `onResume`。
-    * **最终落地**：通过 `mInstrumentation` 回调 `activity.performCreate`，触发 `setContentView` 并完成
-      Window 绑定。
+    * **最终落地**：
+        * **实例化**：`ActivityThread` 通过 `mInstrumentation.newActivity` 利用 **ClassLoader** 和 *
+          *反射**（或现代版本的 `AppComponentFactory`）创建 Activity 实例。
+        * **注入环境**：调用 `activity.attach()`，创建 `PhoneWindow` 并在其中关联 `ContextImpl`、
+          `WindowManager`、`Token` 等核心组件。
+        * **生命周期开启**：通过 `mInstrumentation` 回调 `activity.performCreate`（即 `onCreate`），随后触发
+          `setContentView` 完成布局加载。
 
 #### 🧱 核心重构与演进追问
 
