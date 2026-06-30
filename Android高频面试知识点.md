@@ -260,7 +260,7 @@ Hilt 本质上是 Dagger2 的“精装版”，它通过 **Hilt Gradle Plugin** 
     *   独立进程后，H5 的点击事件或登录请求无法直接修改主进程状态。
     *   **资深方案**：通过 `Messenger` (底层 AIDL) 或 `Socket` 实现双工通信。主进程提供 Bridge Service 接收消息，并在主进程执行真正的业务调度。
     *   **“你为什么选择 Messenger 而不是直接写 AIDL？”**
-    回答： “因为我们的业务场景（如 H5 点击通知）是单向、轻量级的。 Messenger 底层虽然是 AIDL，但它天然通过 Handler 实现了串行化处理，这让我们在处理跨进程消息时不需要考虑复杂的线程同步问题，降低了出错概率。 尽管代码上看起来只是在 onBind 中暴露了 binder，但它实际上建立了一个健壮的跨进程信令通道。”
+        回答： “因为我们的业务场景（如 H5 点击通知）是单向、轻量级的。 Messenger 底层虽然是 AIDL，但它天然通过 Handler 实现了串行化处理，这让我们在处理跨进程消息时不需要考虑复杂的线程同步问题，降低了出错概率。 尽管代码上看起来只是在 onBind 中暴露了 binder，但它实际上建立了一个健壮的跨进程信令通道。”
 
 ### 6.2 离线包与“秒开”极致优化
 
@@ -289,4 +289,36 @@ Hilt 本质上是 Dagger2 的“精装版”，它通过 **Hilt Gradle Plugin** 
 *   **`evaluateJavascript` (Android 4.4+)**：
     *   **优势**：非阻塞、异步、支持 Lambda 回调获取返回值。
     *   **安全实践**：传递参数时需使用 `JSONObject.quote()` 或 JSON 序列化，防止 JS 注入风险（如字符串中的单引号导致语法解析崩溃）。
+
+### 6.6 极致性能：WebView 容器化与复用池架构 (大厂方案)
+
+在追求“秒开”的业务场景下，单纯的缓存已无法满足需求，必须采用**容器化复用策略**：
+
+*   **核心组件：WebViewPool (全局复用池)**
+    *   **预加载 (Pre-warm)**：在 App 闲时（`IdleHandler`）预先创建 1~2 个 WebView 实例，消除首次启动内核的几百毫秒耗时。
+    *   **上下文热切换**：利用 `MutableContextWrapper`。创建时绑定 `Application`，使用时通过 `setBaseContext(activity)` 动态切换，既支持 H5 弹窗又规避了内存泄漏。
+*   **容器化解耦 (H5ContainerActivity)**
+    *   Activity 只作为“空壳”容器，内部通过 `FrameLayout` 动态挂载/卸载从池子中捞出的 WebView。
+*   **状态清洗 (State Cleansing)**：
+    *   **关键考点**：复用会导致 Cookie、LocalStorage、JS 变量污染。
+    *   **回收标准动作**：`loadUrl("about:blank")` -> `clearHistory()` -> `removeJavascriptInterface()` -> 重置 `Context` 为 `Application`。
+*   **性能收益**：
+    *   常规初始化：400ms - 800ms。
+    *   复用池方案：**< 50ms**（仅剩 View 挂载和首屏渲染耗时）。
+
+### 6.7 核心拦截器：shouldInterceptRequest vs shouldOverrideUrlLoading
+
+作为资深开发者，需从**触发时机、执行线程、拦截范围、返回值类型**四个维度进行深度对比：
+
+| 维度 | `shouldOverrideUrlLoading` (路由门卫) | `shouldInterceptRequest` (资源供应商) |
+| :--- | :--- | :--- |
+| **关注点** | **导航控制**（跳到哪？） | **数据内容**（内容是啥？） |
+| **拦截对象** | 主要是页面跳转 (location.href, a标签) | HTML, JS, CSS, 图片, Ajax 等**所有**请求 |
+| **执行线程** | **UI 主线程** (Main Thread) | **子线程** (WebViewCoreThread) |
+| **返回值** | `Boolean` (是否拦截跳转行为) | `WebResourceResponse` (返回替换的数据流) |
+| **发生频率** | 低（仅页面切换时） | **极高**（一个页面加载可触发数十次） |
+
+*   **架构师见解**：
+    *   **路由分发**：涉及 `startActivity` 等 UI 操作时，必须在 `shouldOverrideUrlLoading` 中处理，利用其主线程特性。
+    *   **离线化与代理**：涉及磁盘 IO 或同步网络请求（如 OkHttp 代理）时，必须在 `shouldInterceptRequest` 中处理，利用其子线程特性以避免卡死 UI。
 
